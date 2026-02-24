@@ -2,6 +2,19 @@
 # pip install "git+https://github.com/openai/triton.git#egg=triton&subdirectory=python"
 import pickle
 import math
+import os
+
+if os.getenv("FLASH_ATTN_USE_PROTEUS_JIT") == "1":
+    # PyTorch's Proteus softmax path reads this at module-init time, so ensure
+    # it exists before importing torch.
+    cwd_softmax = "smax_kernel.cu"
+    local_softmax = os.path.join(os.path.dirname(__file__), "smax_kernel.cu")
+    if (not os.path.exists(cwd_softmax)) and os.path.exists(local_softmax):
+        try:
+            os.symlink(local_softmax, cwd_softmax)
+        except FileExistsError:
+            pass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +34,12 @@ except ImportError:
 try:
     import xformers.ops as xops
 except ImportError:
+    xops = None
+
+# Optional benchmark backends can trigger incompatible JIT interactions when
+# FlashAttention itself is running via Proteus JIT.
+if os.getenv("FLASH_ATTN_USE_PROTEUS_JIT") == "1":
+    attention_triton = None
     xops = None
 
 
@@ -74,10 +93,13 @@ dtype = torch.float16
 bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 causal_vals = [False, True]
 headdim_vals = [64, 128]
+dtype_vals = [torch.float16, torch.bfloat16]
 dim = 2048
 dropout_p = 0.0
 
-methods = (["Flash2", "Pytorch"]
+_skip_pytorch = os.getenv("FLASH_ATTN_USE_PROTEUS_JIT") == "1"
+methods = (["Flash2"]
+           + (["Pytorch"] if not _skip_pytorch else [])
            + (["Triton"] if attention_triton is not None else [])
            + (["xformers.c"] if xops is not None else [])
            + (["xformers.f"] if xops is not None else []))
@@ -89,10 +111,11 @@ speed_f = {}
 speed_b = {}
 speed_f_b = {}
 
-for causal in causal_vals:
+for dtype in dtype_vals:
+  for causal in causal_vals:
     for headdim in headdim_vals:
         for batch_size, seqlen in bs_seqlen_vals:
-            config = (causal, headdim, batch_size, seqlen)
+            config = (dtype, causal, headdim, batch_size, seqlen)
             nheads = dim // headdim
 
             # FlashAttention 2
@@ -168,7 +191,8 @@ for causal in causal_vals:
                 time_b[config, "xformers.f"] = b
 
             # Report
-            print(f"### causal={causal}, headdim={headdim}, batch_size={batch_size}, seqlen={seqlen} ###")
+            dtype_name = "fp16" if dtype == torch.float16 else "bf16"
+            print(f"### dtype={dtype_name}, causal={causal}, headdim={headdim}, batch_size={batch_size}, seqlen={seqlen} ###")
             for method in methods:
                 if (config, method) not in time_f or (config, method) not in time_b:
                     continue

@@ -11,11 +11,17 @@
 #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
 
 #include <cutlass/numeric_types.h>
+#include <type_traits>
 
 #include "namespace_config.h"
 #include "hardware_info.h"
 #include "flash.h"
 #include "static_switch.h"
+#ifdef FLASH_ATTN_WITH_PROTEUS_JIT
+#include "flash_fwd_jit_bridge.h"
+#include "flash_fwd_splitkv_jit_bridge.h"
+#include "flash_bwd_jit_bridge.h"
+#endif
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
@@ -245,8 +251,36 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
                 if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+#ifdef FLASH_ATTN_WITH_PROTEUS_JIT
+                    if constexpr (std::is_same_v<elem_type, cutlass::half_t>) {
+                        TORCH_CHECK(
+                            try_run_mha_fwd_jit_fp16(params, stream),
+                            "FlashAttention fp16 non-split fwd is JIT-only in this build, but Proteus JIT launch failed.");
+                        return;
+                    }
+                    if constexpr (std::is_same_v<elem_type, cutlass::bfloat16_t>) {
+                        TORCH_CHECK(
+                            try_run_mha_fwd_jit_bf16(params, stream),
+                            "FlashAttention bf16 non-split fwd is JIT-only in this build, but Proteus JIT launch failed.");
+                        return;
+                    }
+#endif
                     run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
                 } else {
+#ifdef FLASH_ATTN_WITH_PROTEUS_JIT
+                    if constexpr (std::is_same_v<elem_type, cutlass::half_t>) {
+                        TORCH_CHECK(
+                            try_run_mha_fwd_splitkv_jit_fp16(params, stream),
+                            "FlashAttention fp16 split-KV fwd is JIT-only in this build, but Proteus JIT launch failed.");
+                        return;
+                    }
+                    if constexpr (std::is_same_v<elem_type, cutlass::bfloat16_t>) {
+                        TORCH_CHECK(
+                            try_run_mha_fwd_splitkv_jit_bf16(params, stream),
+                            "FlashAttention bf16 split-KV fwd is JIT-only in this build, but Proteus JIT launch failed.");
+                        return;
+                    }
+#endif
                     run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
                 }
             });
@@ -755,6 +789,23 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+#ifdef FLASH_ATTN_WITH_PROTEUS_JIT
+    FP16_SWITCH(!params.is_bf16, [&] {
+        if constexpr (std::is_same_v<elem_type, cutlass::half_t>) {
+            TORCH_CHECK(
+                try_run_mha_bwd_jit_fp16(params, stream),
+                "FlashAttention fp16 bwd is JIT-only in this build, but Proteus JIT launch failed.");
+            return;
+        }
+        if constexpr (std::is_same_v<elem_type, cutlass::bfloat16_t>) {
+            TORCH_CHECK(
+                try_run_mha_bwd_jit_bf16(params, stream),
+                "FlashAttention bf16 bwd is JIT-only in this build, but Proteus JIT launch failed.");
+            return;
+        }
+    });
+    return;
+#endif
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
